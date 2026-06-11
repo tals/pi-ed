@@ -22,7 +22,8 @@
  * prompt.
  *
  * Config:
- *   ED_MODEL=provider/model-id   (default: openai-codex/gpt-5.5, no reasoning)
+ *   ED_MODEL=provider/model-id   (default: the session's selected model)
+ * The rewrite always runs with reasoning effort disabled.
  *
  * Usage:
  * 1. Copy or symlink this file to ~/.pi/agent/extensions/ or your project's .pi/extensions/
@@ -36,8 +37,6 @@ import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-wo
 
 type EditorFactory = NonNullable<Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0]>;
 
-const DEFAULT_PROVIDER = "openai-codex";
-const DEFAULT_MODEL_ID = "gpt-5.5";
 const MAX_TOKENS = 900;
 const MAX_CONTEXT_CHARS = 12_000;
 const MAX_USER_TURNS = 6;
@@ -50,12 +49,19 @@ const SYSTEM_PROMPT = [
 	"Return only the rewritten prompt text. No preamble, no explanation, no markdown fence.",
 ].join("\n");
 
-function resolveModelOverride(): { provider: string; modelId: string } {
+/**
+ * ED_MODEL=provider/model-id overrides the rewrite model; a bare model id
+ * keeps the session model's provider. Default is the session model itself
+ * (reasoning is disabled at the stream call either way).
+ */
+function resolveModel(ctx: ExtensionContext) {
 	const raw = process.env.ED_MODEL;
-	if (!raw) return { provider: DEFAULT_PROVIDER, modelId: DEFAULT_MODEL_ID };
+	if (!raw) return ctx.model;
 	const slash = raw.indexOf("/");
-	if (slash === -1) return { provider: DEFAULT_PROVIDER, modelId: raw };
-	return { provider: raw.slice(0, slash), modelId: raw.slice(slash + 1) };
+	const provider = slash === -1 ? ctx.model?.provider : raw.slice(0, slash);
+	const modelId = slash === -1 ? raw : raw.slice(slash + 1);
+	if (!provider) return ctx.model;
+	return ctx.modelRegistry.find(provider, modelId) ?? ctx.model;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -147,10 +153,12 @@ type EdPreviewResult = { type: "accept"; text: string } | { type: "reject" } | {
  * activates; escape rejects.
  */
 async function streamRewritePreview(ctx: ExtensionContext, draft: string, instruction: string): Promise<EdPreviewResult> {
-	const override = resolveModelOverride();
-	const model = ctx.modelRegistry.find(override.provider, override.modelId) ?? ctx.model;
+	const model = resolveModel(ctx);
 	if (!model) {
-		ctx.ui.notify(`Model not found: ${override.provider}/${override.modelId} (and no session model)`, "error");
+		ctx.ui.notify(
+			process.env.ED_MODEL ? `Model not found: ${process.env.ED_MODEL} (and no session model)` : "No model selected",
+			"error",
+		);
 		return { type: "abort" };
 	}
 

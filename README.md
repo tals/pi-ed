@@ -2,9 +2,9 @@
 
 Explicit one-shot prompt rewriter extension for [pi](https://github.com/badlogic/pi-mono).
 
-Type a rough prompt, append `/ed`, and it gets rewritten into a clear prompt by a
-fast LLM (default `openai-codex/gpt-5.5`, no reasoning), previewed with
-Accept/Reject before anything is sent.
+Type a rough prompt, append `/ed`, and it gets rewritten into a clear prompt
+(by default with the session's selected model, reasoning disabled), previewed
+with Accept/Reject before anything is sent.
 
 ```
 make the loader thing not crash on syntax errs /ed
@@ -34,4 +34,4 @@ or per-project: `ln -s "$PWD/ed.ts" <project>/.pi/extensions/ed.ts`
 
 | Env var | Default | |
 |---|---|---|
-| `ED_MODEL` | `openai-codex/gpt-5.5` | `provider/model-id` for the rewrite |
+| `ED_MODEL` | session model | `provider/model-id` for the rewrite (bare model id keeps the session provider) |
