@@ -1,6 +1,6 @@
 {
   "name": "pi-ed-extension",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Explicit one-shot prompt rewriter extension for pi — append /ed to a rough prompt, preview the rewrite, accept or reject.",
   "keywords": [
     "pi",
@@ -20,6 +20,9 @@
   "main": "ed.ts",
   "exports": {
     ".": "./ed.ts"
+  },
+  "pi": {
+    "extensions": ["ed.ts"]
   },
   "files": [
     "ed.ts",
