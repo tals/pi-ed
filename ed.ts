@@ -304,7 +304,8 @@ async function runEdFlow(ctx: ExtensionContext, draft: string, instruction: stri
 		return;
 	}
 	if (result.type === "reject") {
-		ctx.ui.setEditorText(draft);
+		// Same as abort: restore the message verbatim, /ed token included.
+		ctx.ui.setEditorText(original);
 		ctx.ui.notify("Kept your original text", "info");
 		return;
 	}
