@@ -29,9 +29,9 @@
  * 2. /ed <rough prompt>
  */
 
-import { complete, type UserMessage } from "@earendil-works/pi-ai";
+import { stream, type UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { BorderedLoader, CustomEditor } from "@earendil-works/pi-coding-agent";
+import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 type EditorFactory = NonNullable<Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0]>;
@@ -139,19 +139,28 @@ function parseEdToken(text: string): { draft: string; instruction: string } | un
 	return { draft, instruction };
 }
 
-async function rewrite(ctx: ExtensionContext, draft: string, instruction: string): Promise<string | null> {
+type EdPreviewResult = { type: "accept"; text: string } | { type: "reject" } | { type: "abort" };
+
+/**
+ * Title-less preview dialog that the rewrite streams into as it arrives.
+ * While streaming, escape aborts. Once complete, the Accept/Reject selector
+ * activates; escape rejects.
+ */
+async function streamRewritePreview(ctx: ExtensionContext, draft: string, instruction: string): Promise<EdPreviewResult> {
 	const override = resolveModelOverride();
 	const model = ctx.modelRegistry.find(override.provider, override.modelId) ?? ctx.model;
 	if (!model) {
 		ctx.ui.notify(`Model not found: ${override.provider}/${override.modelId} (and no session model)`, "error");
-		return null;
+		return { type: "abort" };
 	}
 
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 	if (!auth.ok || !auth.apiKey) {
 		ctx.ui.notify(auth.ok ? `No API key for ${model.provider}/${model.id}` : auth.error, "error");
-		return null;
+		return { type: "abort" };
 	}
+	const apiKey = auth.apiKey;
+	const headers = auth.headers;
 
 	const userMessage: UserMessage = {
 		role: "user",
@@ -164,49 +173,71 @@ async function rewrite(ctx: ExtensionContext, draft: string, instruction: string
 		timestamp: Date.now(),
 	};
 
-	return ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-		const loader = new BorderedLoader(tui, theme, `Rewriting prompt (${model.provider}/${model.id})...`);
-		loader.onAbort = () => done(null);
-
-		complete(
-			model,
-			{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
-			{
-				apiKey: auth.apiKey,
-				headers: auth.headers,
-				maxTokens: MAX_TOKENS,
-				reasoningEffort: "none",
-				signal: loader.signal,
-			},
-		)
-			.then((response) => {
-				if (response.stopReason === "aborted") {
-					done(null);
-					return;
-				}
-				done(contentToText(response.content).trim() || null);
-			})
-			.catch((err) => {
-				ctx.ui.notify(`Rewrite failed: ${err instanceof Error ? err.message : String(err)}`, "error");
-				done(null);
-			});
-
-		return loader;
-	});
-}
-
-/** Title-less preview with an Accept/Reject selector. Escape rejects. */
-function showPreviewDialog(ctx: ExtensionContext, rewritten: string): Promise<boolean> {
-	return ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
+	return ctx.ui.custom<EdPreviewResult>((tui, theme, _kb, done) => {
+		let text = "";
+		let streaming = true;
 		let acceptSelected = true;
 		let cached: string[] | undefined;
+		const controller = new AbortController();
 
 		const refresh = () => {
 			cached = undefined;
 			tui.requestRender();
 		};
 
+		const finishStreaming = (finalText: string) => {
+			if (!finalText) {
+				ctx.ui.notify("Rewrite returned no text", "error");
+				done({ type: "abort" });
+				return;
+			}
+			text = finalText;
+			streaming = false;
+			refresh();
+		};
+
+		(async () => {
+			let streamed = "";
+			try {
+				const events = stream(
+					model,
+					{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
+					{ apiKey, headers, maxTokens: MAX_TOKENS, reasoningEffort: "none", signal: controller.signal },
+				);
+				for await (const event of events) {
+					if (controller.signal.aborted) return;
+					if (event.type === "text_delta") {
+						streamed += event.delta;
+						text = streamed;
+						refresh();
+					} else if (event.type === "done") {
+						finishStreaming(streamed.trim() || contentToText(event.message.content).trim());
+						return;
+					} else if (event.type === "error") {
+						ctx.ui.notify(`Rewrite failed: ${event.error.errorMessage ?? event.reason}`, "error");
+						done({ type: "abort" });
+						return;
+					}
+				}
+				finishStreaming(streamed.trim());
+			} catch (err) {
+				if (controller.signal.aborted) return;
+				ctx.ui.notify(`Rewrite failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+				done({ type: "abort" });
+			}
+		})();
+
 		function handleInput(data: string): void {
+			if (matchesKey(data, Key.escape)) {
+				if (streaming) {
+					controller.abort();
+					done({ type: "abort" });
+				} else {
+					done({ type: "reject" });
+				}
+				return;
+			}
+			if (streaming) return;
 			if (
 				matchesKey(data, Key.left) ||
 				matchesKey(data, Key.right) ||
@@ -219,11 +250,7 @@ function showPreviewDialog(ctx: ExtensionContext, rewritten: string): Promise<bo
 				return;
 			}
 			if (matchesKey(data, Key.enter)) {
-				done(acceptSelected);
-				return;
-			}
-			if (matchesKey(data, Key.escape)) {
-				done(false);
+				done(acceptSelected ? { type: "accept", text } : { type: "reject" });
 			}
 		}
 
@@ -233,17 +260,22 @@ function showPreviewDialog(ctx: ExtensionContext, rewritten: string): Promise<bo
 			const add = (s: string) => lines.push(truncateToWidth(s, width));
 
 			add(theme.fg("borderMuted", "─".repeat(Math.max(1, width))));
-			for (const raw of rewritten.split("\n")) {
+			const body = streaming ? `${text}▌` : text;
+			for (const raw of body.split("\n")) {
 				for (const line of wrapTextWithAnsi(raw.length > 0 ? raw : " ", Math.max(1, width - 2))) {
 					add(` ${theme.fg("accent", line)}`);
 				}
 			}
 			lines.push("");
-			const accept = acceptSelected ? theme.fg("success", "▸ Accept") : theme.fg("muted", "  Accept");
-			const reject = acceptSelected ? theme.fg("muted", "  Reject") : theme.fg("error", "▸ Reject");
-			add(` ${accept}    ${reject}`);
-			lines.push("");
-			add(theme.fg("dim", " ←/→ switch · enter confirm · esc reject"));
+			if (streaming) {
+				add(theme.fg("dim", " rewriting… · esc abort"));
+			} else {
+				const accept = acceptSelected ? theme.fg("success", "▸ Accept") : theme.fg("muted", "  Accept");
+				const reject = acceptSelected ? theme.fg("muted", "  Reject") : theme.fg("error", "▸ Reject");
+				add(` ${accept}    ${reject}`);
+				lines.push("");
+				add(theme.fg("dim", " ←/→ switch · enter confirm · esc reject"));
+			}
 			add(theme.fg("borderMuted", "─".repeat(Math.max(1, width))));
 
 			cached = lines;
@@ -256,22 +288,28 @@ function showPreviewDialog(ctx: ExtensionContext, rewritten: string): Promise<bo
 				cached = undefined;
 			},
 			handleInput,
+			dispose: () => {
+				controller.abort();
+			},
 		};
 	});
 }
 
 async function runEdFlow(ctx: ExtensionContext, draft: string, instruction: string, original: string): Promise<void> {
-	const rewritten = await rewrite(ctx, draft, instruction);
-	if (rewritten === null) {
+	const result = await streamRewritePreview(ctx, draft, instruction);
+	if (result.type === "abort") {
 		// Aborted or failed: restore exactly what the user typed, /ed token and
 		// all, as if nothing happened.
 		ctx.ui.setEditorText(original);
 		return;
 	}
-
-	const accepted = await showPreviewDialog(ctx, rewritten);
-	ctx.ui.setEditorText(accepted ? rewritten : draft);
-	ctx.ui.notify(accepted ? "Rewrite accepted · review and submit · undo: ctrl+-" : "Kept your original text", "info");
+	if (result.type === "reject") {
+		ctx.ui.setEditorText(draft);
+		ctx.ui.notify("Kept your original text", "info");
+		return;
+	}
+	ctx.ui.setEditorText(result.text);
+	ctx.ui.notify("Rewrite accepted · review and submit · undo: ctrl+-", "info");
 }
 
 // Same boundaries as parseEdToken, applied per rendered line. The lookahead
